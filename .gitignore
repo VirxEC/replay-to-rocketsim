@@ -2,3 +2,4 @@
 /collision_meshes
 /replays
 *.svg
+Cargo.lock
