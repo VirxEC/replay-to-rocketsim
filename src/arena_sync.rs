@@ -64,6 +64,14 @@ pub(crate) fn sync_arena_to_replay_state(
         car.time_since_boosted = replay_car.state.time_since_boosted;
         car.is_demoed = replay_car.state.is_demoed;
         car.demo_respawn_timer = replay_car.state.demo_respawn_timer;
+        car.is_jumping = replay_car.state.is_jumping;
+        car.is_flipping = replay_car.state.is_flipping;
+        car.flip_time = replay_car.state.flip_time;
+        car.flip_rel_torque = replay_car.state.flip_rel_torque;
+        car.has_jumped = replay_car.state.has_jumped;
+        car.has_double_jumped = replay_car.state.has_double_jumped;
+        car.has_flipped = replay_car.state.has_flipped;
+        car.air_time_since_jump = replay_car.state.air_time_since_jump;
         arena.set_car_state(car_idx, car);
     }
 }

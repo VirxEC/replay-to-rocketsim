@@ -220,6 +220,11 @@ pub struct FrameBallMetadata {
     pub hit_spin_scale: Option<f32>,
     pub air_resistance: Option<Vec3A>,
     pub warn_ball_reset: Option<bool>,
+    /// Ball is sleeping and not at the origin — indicates a goal was scored.
+    /// `true` when `is_sleeping == Some(true) && pos != (0, 0, *)`.
+    /// Used to detect goal frames earlier than the replay metadata claims.
+    /// Defaults to `false` when ball rigid-body data has not been received yet.
+    pub ball_goal_sleep: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

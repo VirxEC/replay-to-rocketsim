@@ -24,6 +24,7 @@ Important caveats:
 - The converter tracks per-field freshness and avoids overwriting RocketSim-simulated fields with stale accumulated replay values.
 - Replay-authored events and RocketSim-simulated events are intentionally separate streams.
 - Exact sub-frame timing of replay-authored events is generally not recovered; replay events are aligned to replay frame/time.
+- Player aerial inputs (pitch/yaw/roll) are not directly recorded in replay data. They are **reconstructed** from angular velocity deltas between frames using an inverse aerial control solver. Discrete actions (jump, boost, dodge, handbrake) are read from replicated component states.
 
 ## Quick start
 

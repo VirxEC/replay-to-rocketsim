@@ -95,9 +95,16 @@ pub(super) fn ball_metadata(
     current_replay_frame: usize,
     current_replay_time: f32,
 ) -> FrameBallMetadata {
+    // Goal detection: ball sleeping while away from origin indicates a goal.
+    let ball_goal_sleep = ball
+        .phys
+        .is_sleeping()
+        .zip(ball.phys.pos())
+        .is_some_and(|(is_sleeping, pos)| is_sleeping && (pos.x != 0.0 || pos.y != 0.0));
     FrameBallMetadata {
         rigid_body: rigid_body_metadata(ball, current_replay_frame, current_replay_time, false),
         hit_team_num: current_hit_team_num,
+        ball_goal_sleep,
         scale: float_attr(&ball.attributes, BALL_SCALE_ATTR),
         gravity_scale: float_attr(&ball.attributes, BALL_GRAVITY_SCALE_ATTR),
         max_linear_speed_scale: float_attr(&ball.attributes, BALL_MAX_SPEED_SCALE_ATTR),

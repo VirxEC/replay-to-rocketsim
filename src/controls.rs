@@ -28,6 +28,18 @@ where
     }
 }
 
+/// Apply a small deadzone — zero out throttle/steer values below 0.01.
+#[must_use]
+pub(crate) fn apply_deadzone(mut controls: CarControls) -> CarControls {
+    if controls.throttle.abs() < 0.01 {
+        controls.throttle = 0.0;
+    }
+    if controls.steer.abs() < 0.01 {
+        controls.steer = 0.0;
+    }
+    controls
+}
+
 pub(crate) fn replicated_boost_amount<K, S>(
     attributes: &std::collections::HashMap<K, Attribute, S>,
 ) -> Option<f32>
@@ -129,5 +141,37 @@ mod tests {
         let controls = car_controls(&FxHashMap::default(), None, Some(&component_attributes));
 
         assert!(controls.jump);
+    }
+
+    #[test]
+    fn deadzone_zeros_near_zero_throttle_and_steer() {
+        let controls = CarControls {
+            throttle: 0.005,
+            steer: -0.008,
+            ..CarControls::default()
+        };
+
+        let controls = apply_deadzone(controls);
+
+        let throttle = controls.throttle;
+        let steer = controls.steer;
+        assert!(throttle.abs() < f32::EPSILON);
+        assert!(steer.abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn deadzone_preserves_values_above_threshold() {
+        let controls = CarControls {
+            throttle: 0.015,
+            steer: -0.5,
+            ..CarControls::default()
+        };
+
+        let controls = apply_deadzone(controls);
+
+        let throttle = controls.throttle;
+        let steer = controls.steer;
+        assert!((throttle - 0.015).abs() < f32::EPSILON);
+        assert!((steer - -0.5).abs() < f32::EPSILON);
     }
 }

@@ -1,13 +1,15 @@
 use boxcars::{ActorId, Attribute, NewActor, ObjectId, UpdatedAttribute};
 use rocketsim::{
-    BallState, BoostPadConfig, BoostPadState, CarBodyConfig, CarControls, CarInfo, CarState, Team,
+    BallState, BoostPadConfig, BoostPadState, CarBodyConfig, CarControls, CarInfo, CarState, Mat3A,
+    Team, Vec3A,
 };
 use rustc_hash::FxHashMap;
 
 use crate::ConvertError;
+use crate::aerial::aerial_inputs;
 use crate::attributes::*;
 use crate::body::car_body_config_for_product_id;
-use crate::controls::{car_controls, replicated_boost_amount};
+use crate::controls::{apply_deadzone, car_controls, replicated_boost_amount};
 use crate::metadata::*;
 use crate::phys::{AccumulatedPhys, PhysFreshness};
 
@@ -32,6 +34,9 @@ pub(crate) struct ActorTracker<'a> {
     previous_car_controls: FxHashMap<ActorId, CarControls>,
     previous_car_action_states: FxHashMap<ActorId, CarActionState>,
     previous_demo_respawn_timers: FxHashMap<ActorId, f32>,
+    previous_car_phys: FxHashMap<ActorId, (Vec3A, Mat3A)>,
+    previous_raw_dodge_active: FxHashMap<ActorId, bool>,
+    previous_dodges_refreshed_counter: FxHashMap<ActorId, i32>,
     boost_timing: FxHashMap<ActorId, BoostTiming>,
     current_ball_hit_team_num: Option<u8>,
     current_replay_frame: usize,
@@ -57,6 +62,9 @@ impl<'a> ActorTracker<'a> {
             previous_car_controls: FxHashMap::default(),
             previous_car_action_states: FxHashMap::default(),
             previous_demo_respawn_timers: FxHashMap::default(),
+            previous_car_phys: FxHashMap::default(),
+            previous_raw_dodge_active: FxHashMap::default(),
+            previous_dodges_refreshed_counter: FxHashMap::default(),
             boost_timing: FxHashMap::default(),
             current_ball_hit_team_num: None,
             current_replay_frame: 0,
@@ -103,6 +111,9 @@ impl<'a> ActorTracker<'a> {
             self.previous_car_controls.remove(actor_id);
             self.previous_car_action_states.remove(actor_id);
             self.previous_demo_respawn_timers.remove(actor_id);
+            self.previous_car_phys.remove(actor_id);
+            self.previous_raw_dodge_active.remove(actor_id);
+            self.previous_dodges_refreshed_counter.remove(actor_id);
             self.boost_timing.remove(actor_id);
         }
     }
@@ -285,6 +296,8 @@ impl<'a> ActorTracker<'a> {
         let mut cars = Vec::with_capacity(car_actor_ids.len());
         let mut current_controls = Vec::with_capacity(car_actor_ids.len());
         let mut current_boost_timing = Vec::with_capacity(car_actor_ids.len());
+        let mut current_raw_dodge_active = Vec::with_capacity(car_actor_ids.len());
+        let mut current_phys_data = Vec::with_capacity(car_actor_ids.len());
         for (idx, actor_id) in car_actor_ids.into_iter().enumerate() {
             let actor = self
                 .actors
@@ -292,11 +305,20 @@ impl<'a> ActorTracker<'a> {
                 .ok_or(ConvertError::MissingActor(actor_id))?;
             let boost_component = self.boost_component_for_car(actor_id);
             let jump_component = self.car_component_for_car(actor_id, ActorKind::JumpComponent);
-            let controls = car_controls(
+            let dodge_component = self.car_component_for_car(actor_id, ActorKind::DodgeComponent);
+            let double_jump_component =
+                self.car_component_for_car(actor_id, ActorKind::DoubleJumpComponent);
+            let flip_car_component =
+                self.car_component_for_car(actor_id, ActorKind::FlipCarComponent);
+
+            let mut controls = car_controls(
                 &actor.attributes,
                 boost_component.map(|actor| &actor.attributes),
                 jump_component.map(|actor| &actor.attributes),
             );
+            // ---- Throttle/steer deadzone ----
+            controls = apply_deadzone(controls);
+
             let prev_controls = self
                 .previous_car_controls
                 .get(&actor_id)
@@ -309,6 +331,8 @@ impl<'a> ActorTracker<'a> {
                 prev_controls,
                 ..CarState::default()
             };
+
+            // ---- Boost ----
             if let Some(boost_component) = boost_component {
                 if bool_attr(&boost_component.attributes, BOOST_NO_BOOST_ATTR) == Some(true) {
                     car.boost = 0.0;
@@ -320,12 +344,25 @@ impl<'a> ActorTracker<'a> {
                     car.boost = boost_amount;
                 }
             }
-            let dodge_component = self.car_component_for_car(actor_id, ActorKind::DodgeComponent);
-            let flip_car_component =
-                self.car_component_for_car(actor_id, ActorKind::FlipCarComponent);
-            if let Some(jump_active) = jump_component.and_then(component_active_attr) {
-                car.is_jumping = jump_active;
-            }
+
+            // ---- Raw action state flags from replay ----
+            let raw_jump_active = jump_component
+                .and_then(component_active_attr)
+                .unwrap_or(false);
+            let raw_dodge_active = dodge_component
+                .and_then(component_active_attr)
+                .unwrap_or(false);
+            let raw_double_jump_active = double_jump_component
+                .and_then(component_active_attr)
+                .unwrap_or(false);
+            let raw_flip_car_active = flip_car_component
+                .and_then(component_active_attr)
+                .unwrap_or(false);
+            let raw_dodge_torque =
+                dodge_component.and_then(|dodge| vec3_attr(&dodge.attributes, DODGE_TORQUE_ATTR));
+
+            // ---- is_jumping / is_flipping from replay data ----
+            car.is_jumping = raw_jump_active;
             if let Some(is_flipping) = dodge_component
                 .and_then(component_active_attr)
                 .or_else(|| flip_car_component.and_then(component_active_attr))
@@ -337,11 +374,107 @@ impl<'a> ActorTracker<'a> {
             {
                 car.flip_time = flip_time;
             }
-            if let Some(dodge_torque) =
-                dodge_component.and_then(|dodge| vec3_attr(&dodge.attributes, DODGE_TORQUE_ATTR))
-            {
+
+            // ---- Dodge torque -> flip_rel_torque ----
+            if let Some(dodge_torque) = raw_dodge_torque {
                 car.flip_rel_torque = dodge_torque;
             }
+
+            // ---- Pitch/yaw/roll reconstruction from aerial controls ----
+            // Uses angular velocity delta between the previous and current frame
+            let previous_phys_data = self.previous_car_phys.get(&actor_id).copied();
+            let frame_delta = self.current_replay_delta;
+            if frame_delta > 0.0
+                && let Some((prev_ang_vel, prev_rot_mat)) = previous_phys_data
+            {
+                let (pitch, yaw, roll) = aerial_inputs(
+                    prev_ang_vel,
+                    phys.ang_vel,
+                    prev_rot_mat,
+                    phys.rot_mat,
+                    frame_delta,
+                    raw_dodge_active,
+                );
+                car.controls.pitch = pitch;
+                car.controls.yaw = yaw;
+                car.controls.roll = roll;
+            }
+
+            // ---- Dodge edge -> pitch/yaw/roll ----
+            // When dodge just started (rising edge), compute inputs from torque
+            let prev_dodge_active = self
+                .previous_raw_dodge_active
+                .get(&actor_id)
+                .copied()
+                .unwrap_or(false);
+            if raw_dodge_active
+                && !prev_dodge_active
+                && let Some(dodge_torque) = raw_dodge_torque
+            {
+                let dodge_pitch = -dodge_torque.y / 2.24;
+                let dodge_roll = -dodge_torque.x / 2.6;
+                let max_val = dodge_pitch.abs().max(dodge_roll.abs());
+                if max_val > 1e-6 {
+                    // Project to unit square (rlgym-tools pattern)
+                    car.controls.pitch = dodge_pitch / max_val;
+                    car.controls.yaw = 0.0;
+                    car.controls.roll = dodge_roll / max_val;
+                } else {
+                    // Stall: both torque components near zero.
+                    // Use the aerial-reconstructed roll sign, default to 1 if zero.
+                    let stall_dir = if car.controls.roll.abs() > 1e-6 {
+                        car.controls.roll.signum()
+                    } else {
+                        1.0
+                    };
+                    car.controls.roll = stall_dir;
+                    car.controls.yaw = -stall_dir;
+                    car.controls.pitch = 0.0;
+                }
+            }
+
+            // ---- Flip reset detection ----
+            let current_reset_counter =
+                int_attr(&actor.attributes, CAR_DODGES_REFRESHED_COUNTER_ATTR);
+            let prev_reset_counter = self
+                .previous_dodges_refreshed_counter
+                .get(&actor_id)
+                .copied();
+            let flip_reset_occurred = match (prev_reset_counter, current_reset_counter) {
+                (Some(prev), Some(curr)) => curr > prev,
+                (None, Some(_)) => true,
+                _ => false,
+            };
+            if flip_reset_occurred && !car.is_on_ground && !car.has_flipped {
+                car.has_jumped = false;
+                car.has_double_jumped = false;
+                car.has_flipped = false;
+                car.air_time_since_jump = 0.0;
+                car.flip_time = 0.0;
+            }
+
+            // ---- Car state alignment for jumps, dodges, double-jumps ----
+            // When these actions are active, align RocketSim's internal flags
+            // so the simulation state matches what the replay observed.
+            if raw_dodge_active || raw_double_jump_active {
+                car.has_flipped = false;
+                car.has_double_jumped = false;
+                if car.air_time_since_jump >= rocketsim::consts::car::jump::DOUBLEJUMP_MAX_DELAY
+                    && raw_dodge_active
+                {
+                    car.air_time_since_jump =
+                        rocketsim::consts::car::jump::DOUBLEJUMP_MAX_DELAY - 1.0 / 120.0;
+                }
+            }
+            if raw_jump_active && !car.is_on_ground {
+                // Player is holding jump in air
+                car.air_time_since_jump = 0.0;
+                car.is_jumping = true;
+                car.has_jumped = true;
+                car.has_flipped = false;
+                car.has_double_jumped = false;
+            }
+
             let boost_timing = self.boost_timing(actor_id, car.controls.boost);
             car.is_boosting = car.controls.boost;
             car.boosting_time = boost_timing.boosting_time;
@@ -361,30 +494,38 @@ impl<'a> ActorTracker<'a> {
                 state: car,
                 phys_freshness: actor.phys.freshness(),
             });
+
             let action_state = CarActionState {
                 jump: car.controls.jump,
                 boost: car.controls.boost,
                 handbrake: car.controls.handbrake,
-                dodge: dodge_component
-                    .and_then(component_active_attr)
-                    .unwrap_or(false),
-                double_jump: self
-                    .car_component_for_car(actor_id, ActorKind::DoubleJumpComponent)
-                    .and_then(component_active_attr)
-                    .unwrap_or(false),
-                flip_car: flip_car_component
-                    .and_then(component_active_attr)
-                    .unwrap_or(false),
+                dodge: raw_dodge_active,
+                double_jump: raw_double_jump_active,
+                flip_car: raw_flip_car_active,
             };
             self.emit_car_action_edges(actor_id, action_state);
             current_controls.push((actor_id, car.controls));
             current_boost_timing.push((actor_id, boost_timing));
+            current_raw_dodge_active.push((actor_id, raw_dodge_active));
+            current_phys_data.push((actor_id, (phys.ang_vel, phys.rot_mat)));
+
+            // Store dodges_refreshed_counter for flip reset detection on next frame
+            if let Some(counter) = current_reset_counter {
+                self.previous_dodges_refreshed_counter
+                    .insert(actor_id, counter);
+            }
         }
         for (actor_id, controls) in current_controls {
             self.previous_car_controls.insert(actor_id, controls);
         }
         for (actor_id, timing) in current_boost_timing {
             self.boost_timing.insert(actor_id, timing);
+        }
+        for (actor_id, active) in current_raw_dodge_active {
+            self.previous_raw_dodge_active.insert(actor_id, active);
+        }
+        for (actor_id, phys_data) in current_phys_data {
+            self.previous_car_phys.insert(actor_id, phys_data);
         }
         Ok(cars)
     }

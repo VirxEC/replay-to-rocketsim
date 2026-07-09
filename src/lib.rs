@@ -28,6 +28,7 @@
 //! replay fields do not overwrite RocketSim-simulated interpolation.
 
 mod actor;
+mod aerial;
 mod arena_config;
 mod arena_sync;
 mod attributes;

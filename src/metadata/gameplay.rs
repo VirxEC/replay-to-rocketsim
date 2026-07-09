@@ -27,13 +27,18 @@ pub(crate) fn infer_gameplay_periods(
         else {
             continue;
         };
-        let end_frame = find_end_frame(frame_metadata, goal_frame, frame_count - 1);
+        // Goal detection: if the ball entered sleep state away from the origin
+        // before the replay metadata's goal frame, use that earlier frame instead.
+        // Ball data after that point is unreliable.
+        let actual_goal_frame =
+            detect_goal_sleep_frame(frame_metadata, start_frame, goal_frame).unwrap_or(goal_frame);
+        let end_frame = find_end_frame(frame_metadata, actual_goal_frame, frame_count - 1);
 
         periods.push(GameplayPeriod {
             start_frame,
             end_frame,
             first_hit_frame,
-            goal_frame: Some(goal_frame),
+            goal_frame: Some(actual_goal_frame),
         });
         start_search_at = end_frame.saturating_add(1);
     }
@@ -93,4 +98,15 @@ fn find_end_frame(
         }
     }
     bounded_end
+}
+
+/// Find the first frame where the ball is sleeping away from the origin
+/// (indicating a goal was scored). This often happens before the replay
+/// metadata's goal frame because the replay updates are delayed.
+fn detect_goal_sleep_frame(
+    frame_metadata: &[ReplayFrameMetadata],
+    start_frame: usize,
+    goal_frame: usize,
+) -> Option<usize> {
+    (start_frame..goal_frame).find(|&idx| frame_metadata[idx].ball.ball_goal_sleep)
 }
