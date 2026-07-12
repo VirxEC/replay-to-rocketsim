@@ -14,14 +14,14 @@ Primary layout:
 
 - `src/lib.rs` — library entrypoint and replay conversion API.
 - `src/aerial.rs` — inverse aerial control solver for pitch/yaw/roll reconstruction.
-- `examples/` — small runnable examples. Examples should take explicit replay paths; do not scan `replays/`.
+- `examples/` — small runnable examples. Examples should take explicit replay paths; do not scan `replays/` implicitly.
 - `tests/` — integration tests when replay fixtures or public API tests are needed.
 - `collision_meshes/` — RocketSim collision meshes used when initializing/stepping arenas.
-- `replays/` — local replay corpus. Subdirectories contain thousands of files.
+- `replays/` — local replay corpus symlink. The target contains subdirectories with thousands of files.
 
 ## Important constraints
 
-- **Do not list or recursively scan `replays/` or its subdirectories with tools.** The corpus is huge and can flood context. If a replay fixture is needed, ask for an explicit path or use `find` with a very narrow known filename pattern and bounded output.
+- **Keep replay scans strictly bounded.** `replays/` is a symlink, so use `find -L` when following it. Never dump the corpus or recursively scan it without a narrow limit. For a small sample, use a command such as `find -L replays -type f -print` with the tool's `head_lines` limit, or use a narrow known path/pattern. Prefer explicit replay paths for tests and examples.
 - The library API should accept raw bytes (`&[u8]`) and return typed RocketSim state data; keep file IO in examples/tests/CLI wrappers.
 - RocketSim uses `glam` types and re-exports them. Prefer `rocketsim::{Vec3A, Mat3A, Quat, ...}` to avoid version mismatches with a separate direct `glam` dependency.
 - Use `boxcars` network parsing (`ParserBuilder::must_parse_network_data`) for replay ingestion.
@@ -36,6 +36,7 @@ Run from repository root (`replay-to-rocketsim`).
 - Lint: `cargo clippy --all-targets --all-features`
 - Format: `cargo +nightly fmt`
 - Run example with an explicit replay: `cargo run --example convert -- <path-to-replay>`
+- Audit replay-vs-prediction drift: `cargo run --release --example audit_prediction -- <path-to-replay> [<more-replays>]`
 
 ## Simulation-relevant replay extraction TODOs
 
@@ -43,7 +44,7 @@ When improving replay fidelity, prioritize data that affects RocketSim state or 
 
 - **Timing and interpolation:** Use replay frame `time`/`delta` to determine RocketSim tick advancement. Keep `ROCKETSIM_TICKS_PER_REPLAY_FRAME` and frame-index tick helpers as nominal/public conveniences, not as the authoritative stepping rule for conversion. `FrameTiming.rocketsim_tick` should match the returned `ArenaState.tick_count`.
 - **Event semantics:** Keep replay-authored events and RocketSim-simulated events distinct. `ConversionOutput::arena_events` are RocketSim `ArenaEvent`s emitted while stepping 120Hz ticks between replay timestamps and should carry RocketSim tick numbers. `ReplayFrameMetadata::events` are observed from replay network data and are replay-frame/time aligned, not sub-frame RocketSim tick events. Do not silently merge or deduplicate these streams without preserving provenance.
-- **Sparse rigid-body freshness:** Actor rigid-body state is accumulated, but each physics field (`pos`, `rot_mat`, `vel`, `ang_vel`) may have different freshness because replay RB updates can omit velocity fields. When syncing to RocketSim, merge only fields updated on the current replay frame unless the arena/car was just initialized or recreated. Do not assign an entire stale accumulated `PhysState` over RocketSim-simulated state.
+- **Sparse rigid-body freshness:** Actor rigid-body state is accumulated, but each physics field (`pos`, `rot_mat`, `vel`, `ang_vel`) may have different freshness because replay RB updates can omit velocity fields. When syncing to RocketSim, merge only fields updated on the current replay frame unless the arena/car was just initialized or recreated. Do not assign an entire stale accumulated `PhysState` over RocketSim-simulated state. Gate inverse aerial-input reconstruction on fresh rotation and angular-velocity fields.
 
 - **Car body / hitbox:** Replays can include PRI loadout attributes such as `TAGame.PRI_TA:ClientLoadout`, `ClientLoadouts`, `ClientLoadoutOnline`, and `ClientLoadoutsOnline`. `boxcars::Loadout::body` is a product id, not directly a `rocketsim::CarBodyConfig`; map body product ids to RocketSim hitbox families (`OCTANE`, `DOMINUS`, `PLANK`, `BREAKOUT`, `HYBRID`, `MERC`) and fall back conservatively when unknown.
 - **Accurate car-player-team links:** Avoid team/order heuristics where possible. Link car actors through `Engine.Pawn:PlayerReplicationInfo`, then PRI actors through `Engine.PlayerReplicationInfo:Team`, then team actors/score through `Engine.TeamInfo:Score`. `../rust-carball/src/actor_handlers/{car,player,team}.rs` has useful patterns.
@@ -58,7 +59,7 @@ When improving replay fidelity, prioritize data that affects RocketSim state or 
 
   **Jump/dodge/boost edge detection:** Detect rising edges (`current_active && !previous_active`) of `ReplicatedActive` for jump, dodge, double-jump, flip-car, and boost components. Ideally these edges should be shifted forward by 1 frame in the emitted action to account for frame delay between player input and replicated state (rlgym-tools uses a dataframe-wide `shift(-1)`). Our sequential per-frame processing applies the action on the frame the replay data shows it, which means aerial inputs and discrete actions are delayed by ~1 replay frame (~33ms) compared to the rlgym-tools model. The car's internal jump/dodge state flags (`has_jumped`, `has_double_jumped`, `has_flipped`, `air_time_since_jump`, `flip_time`, etc.) should be manipulated to align with replay-observed events when preparing state for RocketSim stepping.
 - **Boost pad / pickup state:** Extract pickup actors/attributes (`Attribute::Pickup`, `PickupNew`, `PickupInfo`, and related object names) so `ArenaState` can reflect boost pad availability before stepping RocketSim between replay frames. When a boost pickup is detected, link it to the nearest boost pad by position (within a radius threshold, ~200 units). rlgym-tools uses this proximity approach for pad indexing.
-- **Demolitions and respawns:** Extract `TAGame.Car_TA:ReplicatedDemolish` (`Attribute::Demolish` / `DemolishExtended`) and related car lifecycle state so demo/respawn periods do not get simulated as normal free car physics. Demo state should override stale car physics application. When a car is demoed, detect the bumping car by proximity (nearest non-demoed car within a reasonable distance threshold, e.g. `200 + 2 * CAR_MAX_SPEED * avg_tick_rate / TICKS_PER_SECOND`). Note: RocketSim's `CarState` does not expose a `bump_victim_id` field, so bump victim tracking is limited to metadata/events rather than being set on the arena car state.
+- **Demolitions and respawns:** Extract `TAGame.Car_TA:ReplicatedDemolish` (`Attribute::Demolish` / `DemolishExtended`) and related car lifecycle state so demo/respawn periods do not get simulated as normal free car physics. Demo state should override stale car physics application. When a car is demoed, detect the bumping car by proximity (nearest non-demoed car within a reasonable distance threshold, e.g. `200 + 2 * CAR_MAX_SPEED * avg_tick_rate / TICKS_PER_SECOND`). Note: RocketSim's `CarState` does not expose a `bump_victim_id` field, so bump victim tracking is limited to metadata/events rather than being set on the arena car state. Demo countdowns must be monotonic, must never increase from malformed/negative replay deltas, and must be bounded by RocketSim's respawn duration.
 
 - **Game mode and arena setup:** Prefer replay metadata/actor data that identifies game mode, map, mutators, or non-standard arena setup over hardcoded `GameMode::Soccar` when it affects collision, gravity, ball behavior, or spawn/boost layout.
 - **Ball state beyond rigid body:** Preserve simulation-affecting ball attributes such as sleep/contact/reset state when available. Ball touch/team metadata can be useful for validation, but should not be prioritized over state needed to reproduce physics.

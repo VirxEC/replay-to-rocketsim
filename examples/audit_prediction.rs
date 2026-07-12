@@ -7,7 +7,10 @@
 
 use std::{env, fs};
 
-use replay_to_rocketsim::rocketsim::{Mat3A, Vec3A, init_from_default};
+use replay_to_rocketsim::rocketsim::shared::Aabb;
+use replay_to_rocketsim::rocketsim::{
+    ArenaState, CarState, Mat3A, Vec3A, consts, init_from_default,
+};
 use replay_to_rocketsim::{ConversionOutput, Converter};
 
 const POSITION_TOLERANCE: f32 = 80.0;
@@ -15,7 +18,8 @@ const VELOCITY_TOLERANCE: f32 = 350.0;
 const ANGULAR_VELOCITY_TOLERANCE: f32 = 8.0;
 const ROTATION_TOLERANCE: f32 = 0.35;
 const TIMER_TOLERANCE: f32 = 0.20;
-const MAX_RESPAWN_TIMER: f32 = 10.0;
+const BOOST_TOLERANCE: f32 = 2.0;
+const HANDBRAKE_TOLERANCE: f32 = 0.05;
 const MAX_PRINTED_DISCREPANCIES: usize = 100;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -77,13 +81,14 @@ fn audit(path: &str, output: &ConversionOutput) -> Summary {
         if !prediction_valid {
             continue;
         }
+        let frame = output.frames[frame_idx].replay_frame;
         let ball_meta = &output.frame_metadata[frame_idx].ball.rigid_body;
         if is_fresh(ball_meta.pos_update_age) {
             compare_vec3(
                 &mut summary,
                 &mut printed,
                 path,
-                output.frames[frame_idx].replay_frame,
+                frame,
                 usize::MAX,
                 "ball",
                 "position",
@@ -97,7 +102,7 @@ fn audit(path: &str, output: &ConversionOutput) -> Summary {
                 &mut summary,
                 &mut printed,
                 path,
-                output.frames[frame_idx].replay_frame,
+                frame,
                 usize::MAX,
                 "ball",
                 "velocity",
@@ -106,6 +111,36 @@ fn audit(path: &str, output: &ConversionOutput) -> Summary {
                 VELOCITY_TOLERANCE,
             );
         }
+        if is_fresh(ball_meta.rot_update_age) {
+            compare_mat3(
+                &mut summary,
+                &mut printed,
+                path,
+                frame,
+                usize::MAX,
+                "ball",
+                predicted.ball.phys.rot_mat,
+                observed.ball.phys.rot_mat,
+                ROTATION_TOLERANCE,
+            );
+        }
+        if is_fresh(ball_meta.ang_vel_update_age) {
+            compare_vec3(
+                &mut summary,
+                &mut printed,
+                path,
+                frame,
+                usize::MAX,
+                "ball",
+                "angular_velocity",
+                predicted.ball.phys.ang_vel,
+                observed.ball.phys.ang_vel,
+                ANGULAR_VELOCITY_TOLERANCE,
+            );
+        }
+
+        audit_ball_invariants(&mut summary, &mut printed, path, frame, observed);
+
         for (car_idx, ((_, predicted_car), (_, observed_car))) in
             predicted.cars.iter().zip(&observed.cars).enumerate()
         {
@@ -114,7 +149,6 @@ fn audit(path: &str, output: &ConversionOutput) -> Summary {
             let label = meta
                 .and_then(|car| car.player_name.as_deref())
                 .unwrap_or("unknown");
-            let frame = output.frames[frame_idx].replay_frame;
 
             // These fields are copied from replay on every car row, so they are a direct
             // replay-vs-prediction comparison rather than a comparison of two derived values.
@@ -190,30 +224,16 @@ fn audit(path: &str, output: &ConversionOutput) -> Summary {
                         label,
                         &format!(
                             "demo_respawn_timer predicted={:.3} replay={:.3} delta={:.3}",
-                            predicted_car.demo_respawn_timer, meta.demo_respawn_timer, timer_delta
+                            predicted_car.demo_respawn_timer,
+                            observed_car.demo_respawn_timer,
+                            timer_delta
                         ),
                         false,
                     );
                 }
-                if !meta.demo_respawn_timer.is_finite()
-                    || meta.demo_respawn_timer > MAX_RESPAWN_TIMER
-                {
-                    discrepancy(
-                        &mut summary,
-                        &mut printed,
-                        path,
-                        frame,
-                        car_idx,
-                        label,
-                        &format!(
-                            "IMPOSSIBLE demo_respawn_timer={:.3} (max expected {:.1}s)",
-                            meta.demo_respawn_timer, MAX_RESPAWN_TIMER
-                        ),
-                        true,
-                    );
-                }
             }
 
+            // Lifecycle and continuous state fields synced from replay each frame.
             compare_bool(
                 &mut summary,
                 &mut printed,
@@ -225,6 +245,130 @@ fn audit(path: &str, output: &ConversionOutput) -> Summary {
                 predicted_car.is_demoed,
                 observed_car.is_demoed,
             );
+            compare_bool(
+                &mut summary,
+                &mut printed,
+                path,
+                frame,
+                car_idx,
+                label,
+                "is_on_ground",
+                predicted_car.is_on_ground,
+                observed_car.is_on_ground,
+            );
+            compare_bool(
+                &mut summary,
+                &mut printed,
+                path,
+                frame,
+                car_idx,
+                label,
+                "is_jumping",
+                predicted_car.is_jumping,
+                observed_car.is_jumping,
+            );
+            compare_bool(
+                &mut summary,
+                &mut printed,
+                path,
+                frame,
+                car_idx,
+                label,
+                "is_flipping",
+                predicted_car.is_flipping,
+                observed_car.is_flipping,
+            );
+            compare_bool(
+                &mut summary,
+                &mut printed,
+                path,
+                frame,
+                car_idx,
+                label,
+                "is_boosting",
+                predicted_car.is_boosting,
+                observed_car.is_boosting,
+            );
+            compare_bool(
+                &mut summary,
+                &mut printed,
+                path,
+                frame,
+                car_idx,
+                label,
+                "has_jumped",
+                predicted_car.has_jumped,
+                observed_car.has_jumped,
+            );
+            compare_bool(
+                &mut summary,
+                &mut printed,
+                path,
+                frame,
+                car_idx,
+                label,
+                "has_double_jumped",
+                predicted_car.has_double_jumped,
+                observed_car.has_double_jumped,
+            );
+            compare_bool(
+                &mut summary,
+                &mut printed,
+                path,
+                frame,
+                car_idx,
+                label,
+                "has_flipped",
+                predicted_car.has_flipped,
+                observed_car.has_flipped,
+            );
+            compare_bool(
+                &mut summary,
+                &mut printed,
+                path,
+                frame,
+                car_idx,
+                label,
+                "is_supersonic",
+                predicted_car.is_supersonic,
+                observed_car.is_supersonic,
+            );
+
+            compare_float(
+                &mut summary,
+                &mut printed,
+                path,
+                frame,
+                car_idx,
+                label,
+                "boost",
+                predicted_car.boost,
+                observed_car.boost,
+                BOOST_TOLERANCE,
+            );
+            compare_float(
+                &mut summary,
+                &mut printed,
+                path,
+                frame,
+                car_idx,
+                label,
+                "handbrake_val",
+                predicted_car.handbrake_val,
+                observed_car.handbrake_val,
+                HANDBRAKE_TOLERANCE,
+            );
+
+            audit_car_invariants(
+                &mut summary,
+                &mut printed,
+                path,
+                frame,
+                car_idx,
+                label,
+                observed,
+                observed_car,
+            );
         }
     }
 
@@ -233,6 +377,179 @@ fn audit(path: &str, output: &ConversionOutput) -> Summary {
         path, summary.frames, summary.car_rows, summary.discrepancies, summary.severe
     );
     summary
+}
+
+fn audit_ball_invariants(
+    summary: &mut Summary,
+    printed: &mut usize,
+    path: &str,
+    frame: usize,
+    observed: &ArenaState,
+) {
+    let speed = observed.ball.phys.vel.length();
+    if speed > consts::ball::MAX_SPEED {
+        discrepancy(
+            summary,
+            printed,
+            path,
+            frame,
+            usize::MAX,
+            "ball",
+            &format!(
+                "speed={speed:.2} exceeds ball::MAX_SPEED={:.1}",
+                consts::ball::MAX_SPEED
+            ),
+            true,
+        );
+    }
+
+    let ang_speed = observed.ball.phys.ang_vel.length();
+    if ang_speed > consts::ball::MAX_ANG_SPEED {
+        discrepancy(
+            summary,
+            printed,
+            path,
+            frame,
+            usize::MAX,
+            "ball",
+            &format!(
+                "angular_speed={ang_speed:.3} exceeds ball::MAX_ANG_SPEED={:.1}",
+                consts::ball::MAX_ANG_SPEED
+            ),
+            true,
+        );
+    }
+
+    if !is_inside_aabb(
+        observed.ball.phys.pos,
+        consts::arena::get_aabb(observed.game_mode()),
+    ) {
+        discrepancy(
+            summary,
+            printed,
+            path,
+            frame,
+            usize::MAX,
+            "ball",
+            &format!(
+                "position {:?} outside arena AABB for {:?}",
+                observed.ball.phys.pos,
+                observed.game_mode()
+            ),
+            true,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn audit_car_invariants(
+    summary: &mut Summary,
+    printed: &mut usize,
+    path: &str,
+    frame: usize,
+    car_idx: usize,
+    label: &str,
+    observed_arena: &ArenaState,
+    observed_car: &CarState,
+) {
+    let speed = observed_car.phys.vel.length();
+    if speed > consts::car::MAX_SPEED {
+        discrepancy(
+            summary,
+            printed,
+            path,
+            frame,
+            car_idx,
+            label,
+            &format!(
+                "speed={speed:.2} exceeds car::MAX_SPEED={:.1}",
+                consts::car::MAX_SPEED
+            ),
+            true,
+        );
+    }
+
+    let ang_speed = observed_car.phys.ang_vel.length();
+    if ang_speed > consts::car::MAX_ANG_SPEED {
+        discrepancy(
+            summary,
+            printed,
+            path,
+            frame,
+            car_idx,
+            label,
+            &format!(
+                "angular_speed={ang_speed:.3} exceeds car::MAX_ANG_SPEED={:.1}",
+                consts::car::MAX_ANG_SPEED
+            ),
+            true,
+        );
+    }
+
+    if observed_car.boost < 0.0 || observed_car.boost > consts::car::boost::MAX {
+        discrepancy(
+            summary,
+            printed,
+            path,
+            frame,
+            car_idx,
+            label,
+            &format!(
+                "boost={:.3} outside [0, car::boost::MAX={:.1}]",
+                observed_car.boost,
+                consts::car::boost::MAX
+            ),
+            true,
+        );
+    }
+
+    if observed_car.demo_respawn_timer < 0.0
+        || observed_car.demo_respawn_timer > consts::car::spawn::RESPAWN_TIME
+    {
+        discrepancy(
+            summary,
+            printed,
+            path,
+            frame,
+            car_idx,
+            label,
+            &format!(
+                "IMPOSSIBLE demo_respawn_timer={:.3} outside [0, car::spawn::RESPAWN_TIME={:.1}s]",
+                observed_car.demo_respawn_timer,
+                consts::car::spawn::RESPAWN_TIME
+            ),
+            true,
+        );
+    }
+
+    if !is_inside_aabb(
+        observed_car.phys.pos,
+        consts::arena::get_aabb(observed_arena.game_mode()),
+    ) {
+        discrepancy(
+            summary,
+            printed,
+            path,
+            frame,
+            car_idx,
+            label,
+            &format!(
+                "position {:?} outside arena AABB for {:?}",
+                observed_car.phys.pos,
+                observed_arena.game_mode()
+            ),
+            true,
+        );
+    }
+}
+
+fn is_inside_aabb(pos: Vec3A, aabb: Aabb) -> bool {
+    pos.x >= aabb.min.x
+        && pos.x <= aabb.max.x
+        && pos.y >= aabb.min.y
+        && pos.y <= aabb.max.y
+        && pos.z >= aabb.min.z
+        && pos.z <= aabb.max.z
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -290,6 +607,36 @@ fn compare_mat3(
             car,
             label,
             &format!("rotation delta={delta:.3} tol={tolerance:.2}"),
+            false,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compare_float(
+    summary: &mut Summary,
+    printed: &mut usize,
+    path: &str,
+    frame: usize,
+    car: usize,
+    label: &str,
+    field: &str,
+    predicted: f32,
+    observed: f32,
+    tolerance: f32,
+) {
+    let delta = (observed - predicted).abs();
+    if delta > tolerance || !delta.is_finite() {
+        discrepancy(
+            summary,
+            printed,
+            path,
+            frame,
+            car,
+            label,
+            &format!(
+                "{field} delta={delta:.3} predicted={predicted:.3} replay={observed:.3} tol={tolerance:.3}"
+            ),
             false,
         );
     }

@@ -115,6 +115,7 @@ impl Converter {
         let mut frame_metadata = Vec::with_capacity(network_frames.frames.len());
         let mut cars_metadata = Vec::with_capacity(network_frames.frames.len());
         let mut previous_car_actor_ids: Option<Vec<i32>> = None;
+        let mut previous_frame_was_kickoff = false;
 
         for (replay_frame, frame) in network_frames.frames.iter().enumerate() {
             tracker.begin_frame(frame.delta, replay_frame, frame.time);
@@ -127,6 +128,10 @@ impl Converter {
                 frame.time,
             )?;
             tracker.refresh_indices();
+            let replay_frame_metadata = tracker.frame_metadata();
+            // The kickoff flag can be absent on sparse initial frames. Until the replay
+            // explicitly reports that the ball has been hit, treat the prediction as kickoff.
+            let frame_is_kickoff = replay_frame_metadata.game_event.ball_has_been_hit != Some(true);
 
             let target_rocketsim_tick = replay_time_to_rocketsim_tick(frame.time);
             let mut replay_frame_arena_events = Vec::new();
@@ -157,11 +162,18 @@ impl Converter {
                 arena = Arena::new_with_config(arena_config.clone());
             }
             let boost_pads = tracker.boost_pad_states(&boost_pad_configs);
-            let replay_frame_metadata = tracker.frame_metadata();
             let mut predicted_state = arena.get_arena_state();
             predicted_state.tick_count = current_rocketsim_tick;
             predicted_states.push(predicted_state);
-            prediction_valid.push(arena_synced && !arena_recreated);
+            // RocketSim does not model replay kickoff freezing in this prediction path. Mark the
+            // kickoff frames and the first post-kickoff prediction invalid rather than reporting
+            // the expected stationary-car versus simulated-car divergence as a prediction error.
+            prediction_valid.push(
+                arena_synced
+                    && !arena_recreated
+                    && !frame_is_kickoff
+                    && !previous_frame_was_kickoff,
+            );
             sync_arena_to_replay_state(
                 &mut arena,
                 &ball,
@@ -190,6 +202,7 @@ impl Converter {
                 ..replay_frame_metadata
             });
             previous_car_actor_ids = Some(current_car_actor_ids);
+            previous_frame_was_kickoff = frame_is_kickoff;
             cars_metadata.push(replay_cars_metadata);
             arena_events.push(replay_frame_arena_events);
             states.push(state);
@@ -231,7 +244,10 @@ pub struct ConversionOutput {
     /// This is intended for diagnostics and model-fidelity tooling. The first frame can contain
     /// `RocketSim` defaults because there is no preceding replay state to predict from.
     pub predicted_states: Vec<ArenaState>,
-    /// Whether each pre-sync prediction was based on a previously synchronized, unchanged arena.
+    /// Whether each pre-sync prediction is comparable with the replay frame.
+    ///
+    /// Kickoff frames and the first frame after kickoff are marked invalid because `RocketSim` does
+    /// not model the replay's stationary kickoff phase in the prediction path.
     pub prediction_valid: Vec<bool>,
     /// `RocketSim`-native events emitted while stepping from the previous replay timestamp to the
     /// corresponding entry in [`frames`](Self::frames).
