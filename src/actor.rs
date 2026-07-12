@@ -84,11 +84,16 @@ impl<'a> ActorTracker<'a> {
         self.current_replay_delta = replay_delta;
         self.active_replay_frame = Some(replay_frame);
         self.current_events.clear();
+        let countdown_delta = replay_delta.max(0.0);
         for actor in self.actors.values_mut() {
-            actor.demo_respawn_timer = (actor.demo_respawn_timer - replay_delta).max(0.0);
+            actor.demo_respawn_timer = countdown(
+                actor.demo_respawn_timer,
+                countdown_delta,
+                rocketsim::consts::car::spawn::RESPAWN_TIME,
+            );
         }
         for cooldown in self.boost_pad_cooldowns.values_mut() {
-            *cooldown = (*cooldown - replay_delta).max(0.0);
+            *cooldown = countdown(*cooldown, countdown_delta, f32::INFINITY);
         }
     }
 
@@ -383,8 +388,11 @@ impl<'a> ActorTracker<'a> {
             // ---- Pitch/yaw/roll reconstruction from aerial controls ----
             // Uses angular velocity delta between the previous and current frame
             let previous_phys_data = self.previous_car_phys.get(&actor_id).copied();
+            let freshness = actor.phys.freshness();
             let frame_delta = self.current_replay_delta;
             if frame_delta > 0.0
+                && freshness.rot_frame == Some(self.current_replay_frame)
+                && freshness.ang_vel_frame == Some(self.current_replay_frame)
                 && let Some((prev_ang_vel, prev_rot_mat)) = previous_phys_data
             {
                 let (pitch, yaw, roll) = aerial_inputs(
@@ -492,7 +500,7 @@ impl<'a> ActorTracker<'a> {
             cars.push(ReplayCarState {
                 info: CarInfo { idx, team, config },
                 state: car,
-                phys_freshness: actor.phys.freshness(),
+                phys_freshness: freshness,
             });
 
             let action_state = CarActionState {
@@ -1275,6 +1283,10 @@ enum ActorKind {
     Other,
 }
 
+fn countdown(value: f32, delta: f32, maximum: f32) -> f32 {
+    (value - delta.max(0.0)).clamp(0.0, maximum)
+}
+
 fn active_actor_id(attribute: Option<&Attribute>) -> Option<ActorId> {
     match attribute {
         Some(Attribute::ActiveActor(active_actor)) if active_actor.active => {
@@ -1320,6 +1332,14 @@ mod tests {
 
     use super::*;
     use crate::metadata::BoostPickupSource;
+
+    #[test]
+    fn countdown_never_increases_or_exceeds_maximum() {
+        assert!((countdown(3.0, -10.0, 3.0) - 3.0).abs() < f32::EPSILON);
+        assert!((countdown(3.0, 1.0, 3.0) - 2.0).abs() < f32::EPSILON);
+        assert!(countdown(3.0, 10.0, 3.0).abs() < f32::EPSILON);
+        assert!((countdown(100.0, 0.0, 3.0) - 3.0).abs() < f32::EPSILON);
+    }
 
     #[test]
     fn pickup_released_clears_replay_pad_cooldown() {

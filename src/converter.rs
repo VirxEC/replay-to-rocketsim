@@ -108,10 +108,13 @@ impl Converter {
         let mut arena_synced = false;
         let mut current_rocketsim_tick = 0;
         let mut states = Vec::with_capacity(network_frames.frames.len());
+        let mut predicted_states = Vec::with_capacity(network_frames.frames.len());
+        let mut prediction_valid = Vec::with_capacity(network_frames.frames.len());
         let mut arena_events = Vec::with_capacity(network_frames.frames.len());
         let mut frames = Vec::with_capacity(network_frames.frames.len());
         let mut frame_metadata = Vec::with_capacity(network_frames.frames.len());
         let mut cars_metadata = Vec::with_capacity(network_frames.frames.len());
+        let mut previous_car_actor_ids: Option<Vec<i32>> = None;
 
         for (replay_frame, frame) in network_frames.frames.iter().enumerate() {
             tracker.begin_frame(frame.delta, replay_frame, frame.time);
@@ -142,12 +145,23 @@ impl Converter {
             let ball = tracker.ball_state()?.unwrap_or_default();
             let cars = tracker.car_states(self.car_body)?;
             let replay_cars_metadata = tracker.car_metadata(self.car_body);
-            let arena_recreated = arena_car_layout_changed(&arena, &cars);
+            let current_car_actor_ids = replay_cars_metadata
+                .iter()
+                .map(|car| car.car_actor_id)
+                .collect::<Vec<_>>();
+            let actor_layout_changed = previous_car_actor_ids
+                .as_ref()
+                .is_some_and(|previous| previous != &current_car_actor_ids);
+            let arena_recreated = actor_layout_changed || arena_car_layout_changed(&arena, &cars);
             if arena_recreated {
                 arena = Arena::new_with_config(arena_config.clone());
             }
             let boost_pads = tracker.boost_pad_states(&boost_pad_configs);
             let replay_frame_metadata = tracker.frame_metadata();
+            let mut predicted_state = arena.get_arena_state();
+            predicted_state.tick_count = current_rocketsim_tick;
+            predicted_states.push(predicted_state);
+            prediction_valid.push(arena_synced && !arena_recreated);
             sync_arena_to_replay_state(
                 &mut arena,
                 &ball,
@@ -175,6 +189,7 @@ impl Converter {
                 ball: ball.metadata,
                 ..replay_frame_metadata
             });
+            previous_car_actor_ids = Some(current_car_actor_ids);
             cars_metadata.push(replay_cars_metadata);
             arena_events.push(replay_frame_arena_events);
             states.push(state);
@@ -188,6 +203,8 @@ impl Converter {
 
         Ok(ConversionOutput {
             states,
+            predicted_states,
+            prediction_valid,
             arena_events,
             frames,
             metadata,
@@ -207,8 +224,15 @@ impl Converter {
 /// Full conversion result with timing metadata.
 #[derive(Debug, Clone)]
 pub struct ConversionOutput {
-    /// One `RocketSim` arena snapshot per replay network frame.
+    /// One replay-aligned arena snapshot per replay network frame, after replay state is merged.
     pub states: Vec<ArenaState>,
+    /// The `RocketSim` prediction immediately before that frame's fresh replay state is merged.
+    ///
+    /// This is intended for diagnostics and model-fidelity tooling. The first frame can contain
+    /// `RocketSim` defaults because there is no preceding replay state to predict from.
+    pub predicted_states: Vec<ArenaState>,
+    /// Whether each pre-sync prediction was based on a previously synchronized, unchanged arena.
+    pub prediction_valid: Vec<bool>,
     /// `RocketSim`-native events emitted while stepping from the previous replay timestamp to the
     /// corresponding entry in [`frames`](Self::frames).
     ///
