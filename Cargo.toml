@@ -12,9 +12,8 @@ name = "parse_replays"
 boxcars = "0.11.4"
 glam = "0.33.2"
 rocketsim = {
-  git = "https://github.com/VirxEC/RocketSim.git",
-  branch = "supersonic",
-  version = "0.2.0"
+  git = "https://github.com/ZealanL/RocketSim.git",
+  branch = "v3-rust",
 }
 rustc-hash = "2.1.3"
 thiserror = "2.0.18"
